@@ -1,13 +1,10 @@
 #![recursion_limit = "1024"]
 
-// #[macro_use]
-// extern crate clap;
 #[macro_use]
 extern crate error_chain;
 #[macro_use] 
 extern crate log;
 extern crate crossbeam_channel as channel;
-extern crate env_logger;
 extern crate byteorder;
 extern crate mio;
 extern crate slab;
@@ -32,6 +29,8 @@ mod connection;
 mod server;
 
 use std::net::SocketAddr;
+use channel::{Sender,Receiver};
+use worker::MsgBuf;
 use mio::Poll;
 use mio::net::TcpListener;
 use errors::*;
@@ -113,15 +112,42 @@ pub trait MessageHandler: Sync {
     fn deserialize(&self, buf: Vec<u8>) -> Result<Self::Req>;
 }
 
+pub struct Shutdown {
+    read_tx: Sender<MsgBuf>,
+    read_rx: Receiver<MsgBuf>,
+    write_tx: Sender<MsgBuf>,
+    write_rx: Receiver<MsgBuf>,
+}
+
+impl Shutdown {
+    fn new(read_tx: Sender<MsgBuf>, read_rx: Receiver<MsgBuf>,
+            write_tx: Sender<MsgBuf>, write_rx: Receiver<MsgBuf>) -> Shutdown {
+        Shutdown {
+            read_tx: read_tx,
+            read_rx: read_rx,
+            write_tx: write_tx,
+            write_rx: write_rx,
+        }    
+    }
+
+    pub fn shutdown(&self) {
+        self.read_tx.disconnect();
+        self.write_tx.disconnect();
+        self.read_rx.disconnect();
+        self.write_rx.disconnect();
+    }
+}
+
 //todo return shutdown handle which will close channels and shut it all down
 pub fn bootstrap<I, O>(listen_addr: SocketAddr, num_workers: u16, 
-        handler: &MessageHandler<Req=I, Resp=O>) -> Result<()> {
+        handler: &MessageHandler<Req=I, Resp=O>) -> Result<(Shutdown)> {
+    assert!(num_workers >= 2, "num_wokers must be at least two");
 
     let sock = TcpListener::bind(&listen_addr)?;
     let (read_tx, read_rx) = channel::unbounded();
     let (write_tx, write_rx) = channel::unbounded();
 
-    for _ in 0..num_workers {
+    for _ in 0..num_workers-1 {
         crossbeam::scope(|s| {
             s.spawn(|| {
                 let mut worker = Worker::new(handler, &read_rx, &write_tx);
@@ -130,12 +156,21 @@ pub fn bootstrap<I, O>(listen_addr: SocketAddr, num_workers: u16,
             });
         });
     }
-    let mut poll = Poll::new().expect("Failed to create poll");
-    let mut server = Server::new(sock, read_tx, write_rx);
-    info!("server starting on {}", listen_addr);
-    server.run(&mut poll).expect("failed to start server");
 
-    Ok(())
+    let server_read_tx = read_tx.clone();
+    let server_write_rx = write_rx.clone();
+
+    crossbeam::scope(|s| {
+        s.spawn(|| {
+            let mut poll = Poll::new().expect("Failed to create poll");
+            let mut server = Server::new(sock, server_read_tx, server_write_rx);
+
+            info!("server starting on {}", listen_addr);
+            server.run(&mut poll).expect("failed to start server");
+        });
+    });
+
+    Ok(Shutdown::new(read_tx, read_rx, write_tx, write_rx))
 }
 
 
@@ -143,9 +178,41 @@ pub fn bootstrap<I, O>(listen_addr: SocketAddr, num_workers: u16,
 
 #[cfg(test)]
 mod tests {
+
+    use ::*;
+    use ::std::net::SocketAddr;
+
+    struct Reverser{}
+
+    impl MessageHandler for Reverser {
+        type Req = String;
+        type Resp = String;
+
+        fn process(&self, msg: String) -> Result<String> {
+            let msg = msg.chars().rev().collect::<String>();
+            Ok(msg)
+        }
+
+        fn serialize(&self, msg: String) -> Result<Vec<u8>> {
+            Ok(msg.as_bytes().to_vec())
+        }
+
+        fn deserialize(&self, buf: Vec<u8>) -> Result<String> {
+            match String::from_utf8(buf) {
+                Ok(msg) => Ok(msg),
+                Err(_) => Err("couldn't build string".into())
+            }
+        }
+    }
+
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn boot() {
+        let addr: SocketAddr = "127.0.0.1:7866".parse().expect("couldn't parse address string");
+        let num_workers = 4;
+        let handler = Reverser{};
+        if let Ok(sd) = ::bootstrap(addr, num_workers, &handler) {
+             sd.shutdown();
+        }
     }
 }
 
