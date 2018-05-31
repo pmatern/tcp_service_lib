@@ -12,7 +12,7 @@ mod worker;
 mod connection;
 mod server;
 
-pub mod errors {
+mod errors {
     use worker::MsgBuf;
 
     // Create the Error, ErrorKind, ResultExt, and Result types
@@ -30,82 +30,16 @@ pub mod errors {
     }
 }
 
+pub use errors::*;
+
 use std::net::SocketAddr;
 use mio::Poll;
 use mio::net::TcpListener;
-use errors::*;
 use worker::{Worker,MsgBuf};
 use server::Server;
 use std::sync::mpsc;
 use std::sync::mpsc::Sender;
 use std::thread;
-
-
-/*
-learning project based on https://github.com/hjr3/mob
-Single threaded non blocking echo server which frames messages by prepending the message length
-todo is add threads per cpu,
-and maybe crossbeam-channel to pass stuff between threads?
-*/
-
-/*
-fn main() {
-    if let Err(ref e) = run() {
-        println!("error: {}", e);
-
-        for e in e.iter().skip(1) {
-            println!("caused by: {}", e);
-        }
-
-        if let Some(backtrace) = e.backtrace() {
-            println!("backtrace: {:?}", backtrace);
-        }
-
-        ::std::process::exit(1);
-    }
-}
-
-
-
-pub fn run() -> Result<()> {
-    env_logger::init();
-
-    let matches = clap_app!(myapp =>
-        (version: "0.1.0")
-        (author: "pete.matern@nike.com")
-        (about: "service proxy with fancy networking behavior")
-        (@arg listen_addr: -a --listen_address +takes_value "address to bind to")
-        (@arg port: -p --port +takes_value "port to listen on")
-    ).get_matches();
-
-    let mut listen_addr = String::from(matches.value_of("listen_addr").unwrap_or("127.0.0.1"));
-    listen_addr.push_str(":");
-    listen_addr.push_str(matches.value_of("port").unwrap_or("7777"));
-        
-    let addr: SocketAddr = listen_addr.parse()?;
-    let sock = TcpListener::bind(&addr)?;
-    let (ready_tx, ready_rx) = channel::unbounded();
-    let (register_tx, register_rx) = channel::unbounded();
-
-    crossbeam::scope(|s| {
-        let mut worker = Worker::new(read_rx, register_tx);
-
-        info!("worker starting");
-
-        worker.run().expect("failed to start worker");
-    });
-    
-    let mut poll = Poll::new()?;
-
-    let mut server = Acceptor::new(poll, sock, ready_tx, register_rx);
-
-    info!("acceptor starting on {}", listen_addr);
-
-    server.run().expect("failed to start server");
-
-    Ok(())
-}
-*/
 
 
 pub trait MessageHandler: Sync {
