@@ -1,7 +1,8 @@
 use ::MessageHandler;
-use channel::{Sender, Receiver};
+use std::sync::mpsc::{Sender, Receiver};
 use errors::*;
 
+#[derive(Debug, Clone)]
 pub struct MsgBuf {
     pub conn_idx: usize,
     pub buf: Vec<u8>,
@@ -14,17 +15,25 @@ impl MsgBuf {
             buf: buf,
         }
     }
+
+    pub fn shutdown_msg() -> MsgBuf {
+        MsgBuf {
+            conn_idx: 111_111,
+            buf: vec!{},
+        }
+
+    }
 }
 
 pub struct Worker<'a, I: 'a, O: 'a> {
     handler: &'a MessageHandler<Req=I, Resp=O>,
-    read_rx: &'a Receiver<MsgBuf>,
-    write_tx: &'a Sender<MsgBuf>,
+    read_rx: Receiver<MsgBuf>,
+    write_tx: Sender<MsgBuf>,
 }
 
 impl<'a, I, O> Worker<'a, I, O> {
-    pub fn new(handler: &'a MessageHandler<Req=I, Resp=O>, read_rx: &'a Receiver<MsgBuf>, 
-            write_tx: &'a Sender<MsgBuf>) -> Worker<'a, I, O> {
+    pub fn new(handler: &'a MessageHandler<Req=I, Resp=O>, read_rx: Receiver<MsgBuf>, 
+            write_tx: Sender<MsgBuf>) -> Worker<'a, I, O> {
         Worker {
             handler: handler,
             read_rx: read_rx,
@@ -47,13 +56,8 @@ impl<'a, I, O> Worker<'a, I, O> {
                 self.handle_input(buf)
             },
             Err(e) => {
-                if self.read_rx.is_disconnected() {
-                    info!("input channel disconnected");
-                    false
-                } else {
-                    warn!("error receiving input in worker: {:?}", e);
-                    true
-                }
+                info!("error receiving input in worker: {:?}. presuming shutdown", e);
+                false
             }
         }
     }
@@ -99,13 +103,8 @@ impl<'a, I, O> Worker<'a, I, O> {
         match self.write_tx.send(buf) {
             Ok(()) => true,
             Err(e) => {
-                if self.write_tx.is_disconnected() {
-                    info!("output channel disconnected");
-                    false
-                } else {
-                    warn!("error sending output in worker: {:?}", e);
-                    true
-                }
+                info!("error sending output in worker: {:?}. presuming shutdown", e);
+                false
             }
         }
     }

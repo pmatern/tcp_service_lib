@@ -4,38 +4,42 @@
 extern crate error_chain;
 #[macro_use] 
 extern crate log;
-extern crate crossbeam_channel as channel;
 extern crate byteorder;
 extern crate mio;
 extern crate slab;
-extern crate crossbeam;
 
+mod worker;
+mod connection;
+mod server;
 
 mod errors {
+    use worker::MsgBuf;
+
     // Create the Error, ErrorKind, ResultExt, and Result types
     error_chain! {
         foreign_links {
             Fmt(::std::fmt::Error);
             Io(::std::io::Error) #[cfg(unix)];
             Net(::std::net::AddrParseError);
-            ChanRecv(::channel::TryRecvError);
-            ChanSend(::channel::TrySendError<Vec<u8>>);
+            TryChanRecv(::mpsc::TryRecvError);
+            TryChanSend(::mpsc::TrySendError<MsgBuf>);
+            ChanRecv(::mpsc::RecvError);
+            ChanSend(::mpsc::SendError<MsgBuf>);
+
         }
     }
 }
 
-mod worker;
-mod connection;
-mod server;
-
 use std::net::SocketAddr;
-use channel::{Sender,Receiver};
-use worker::MsgBuf;
 use mio::Poll;
 use mio::net::TcpListener;
 use errors::*;
-use worker::Worker;
+use worker::{Worker,MsgBuf};
 use server::Server;
+use std::sync::mpsc;
+use std::sync::mpsc::Sender;
+use std::thread;
+
 
 /*
 learning project based on https://github.com/hjr3/mob
@@ -113,64 +117,55 @@ pub trait MessageHandler: Sync {
 }
 
 pub struct Shutdown {
-    read_tx: Sender<MsgBuf>,
-    read_rx: Receiver<MsgBuf>,
+    read_tx: Vec<Sender<MsgBuf>>,
     write_tx: Sender<MsgBuf>,
-    write_rx: Receiver<MsgBuf>,
 }
 
 impl Shutdown {
-    fn new(read_tx: Sender<MsgBuf>, read_rx: Receiver<MsgBuf>,
-            write_tx: Sender<MsgBuf>, write_rx: Receiver<MsgBuf>) -> Shutdown {
-        Shutdown {
-            read_tx: read_tx,
-            read_rx: read_rx,
-            write_tx: write_tx,
-            write_rx: write_rx,
-        }    
-    }
+    pub fn shutdown(&self) -> Result<()> {
+        for tx in &self.read_tx {
+            tx.send(MsgBuf::shutdown_msg())?;
+        }
+        self.write_tx.send(MsgBuf::shutdown_msg())?;
 
-    pub fn shutdown(&self) {
-        self.read_tx.disconnect();
-        self.write_tx.disconnect();
-        self.read_rx.disconnect();
-        self.write_rx.disconnect();
+        Ok(())
     }
 }
 
-//todo return shutdown handle which will close channels and shut it all down
 pub fn bootstrap<I, O>(listen_addr: SocketAddr, num_workers: u16, 
-        handler: &MessageHandler<Req=I, Resp=O>) -> Result<(Shutdown)> {
+    handler: &'static MessageHandler<Req=I, Resp=O>) -> Result<(Shutdown)> {
     assert!(num_workers >= 2, "num_wokers must be at least two");
 
     let sock = TcpListener::bind(&listen_addr)?;
-    let (read_tx, read_rx) = channel::unbounded();
-    let (write_tx, write_rx) = channel::unbounded();
+    let (write_tx, write_rx) = mpsc::channel();
+    let mut all_read_tx : Vec<Sender<MsgBuf>> = vec!{};
+
+    let sd = Shutdown {
+        read_tx: all_read_tx.to_owned(),
+        write_tx: write_tx.clone(),
+    };
 
     for _ in 0..num_workers-1 {
-        crossbeam::scope(|s| {
-            s.spawn(|| {
-                let mut worker = Worker::new(handler, &read_rx, &write_tx);
-                info!("worker starting");
-                worker.run().expect("failed to start worker");
-            });
+        let (read_tx, read_rx) = mpsc::channel();
+        all_read_tx.push(read_tx);
+        let worker_write_tx = write_tx.clone();
+
+        thread::spawn(move || {
+            let mut worker = Worker::new(handler, read_rx, worker_write_tx);
+            info!("worker starting");
+            worker.run().expect("failed to start worker");
         });
     }
 
-    let server_read_tx = read_tx.clone();
-    let server_write_rx = write_rx.clone();
+    thread::spawn(move || {
+        let mut poll = Poll::new().expect("Failed to create poll");
+        let mut server = Server::new(sock, all_read_tx, write_rx);
 
-    crossbeam::scope(|s| {
-        s.spawn(|| {
-            let mut poll = Poll::new().expect("Failed to create poll");
-            let mut server = Server::new(sock, server_read_tx, server_write_rx);
-
-            info!("server starting on {}", listen_addr);
-            server.run(&mut poll).expect("failed to start server");
-        });
+        info!("server starting on {}", listen_addr);
+        server.run(&mut poll).expect("failed to start server");
     });
-
-    Ok(Shutdown::new(read_tx, read_rx, write_tx, write_rx))
+    
+    Ok(sd)
 }
 
 
@@ -179,9 +174,10 @@ pub fn bootstrap<I, O>(listen_addr: SocketAddr, num_workers: u16,
 #[cfg(test)]
 mod tests {
 
-    use ::*;
-    use ::std::net::SocketAddr;
-
+    use std::net::SocketAddr;
+    use ::MessageHandler;
+    use ::errors::*;
+    
     struct Reverser{}
 
     impl MessageHandler for Reverser {
@@ -205,13 +201,21 @@ mod tests {
         }
     }
 
+    static HANDLER: Reverser = Reverser{};
+
     #[test]
     fn boot() {
         let addr: SocketAddr = "127.0.0.1:7866".parse().expect("couldn't parse address string");
         let num_workers = 4;
-        let handler = Reverser{};
-        if let Ok(sd) = ::bootstrap(addr, num_workers, &handler) {
-             sd.shutdown();
+        if let Ok(sd) = ::bootstrap(addr, num_workers, &HANDLER) {
+            println!("got here");
+
+              match sd.shutdown() {
+                  Ok(()) => {},
+                  Err(_e) => {
+                      panic!("had trouble shutting down.");
+                  }
+              }
         }
     }
 }

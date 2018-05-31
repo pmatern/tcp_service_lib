@@ -1,7 +1,7 @@
 use mio::{Poll, Events, Token, PollOpt, Ready};
 use mio::net::{TcpListener, TcpStream};
 use mio::unix::UnixReady;
-use channel::{Sender, Receiver}; 
+use std::sync::mpsc::{Sender, Receiver}; 
 use slab::Slab;
 use connection::Connection;
 use worker::MsgBuf;
@@ -14,12 +14,13 @@ pub struct Server {
     sock: TcpListener,
     token: Token,
     events: Events,
-    read: Sender<MsgBuf>,
+    read: Vec<Sender<MsgBuf>>,
     write: Receiver<MsgBuf>,
+    read_idx: usize,
 }
 
 impl Server {
-    pub fn new(sock: TcpListener, read: Sender<MsgBuf>, write: Receiver<MsgBuf>) -> Server {
+    pub fn new(sock: TcpListener, read: Vec<Sender<MsgBuf>>, write: Receiver<MsgBuf>) -> Server {
         Server {
             conns: Slab::with_capacity(128),
             sock: sock,
@@ -27,72 +28,91 @@ impl Server {
             events: Events::with_capacity(1024),
             read: read,
             write: write,
+            read_idx: 0,
         }
     }
 
     pub fn run(&mut self, poll: &mut Poll) -> Result<()> {
         poll.register(&self.sock, self.token, Ready::readable(), PollOpt::edge())?;
-
+        
         loop {
+            self.handle_writes();
+            
+            //write events coming in need to wake up this poller. may need to implement Evented for the write receiver after all
             let cnt = poll.poll(&mut self.events, None)?;
             debug!("processing {} events", cnt);
 
             #[allow(deprecated)]
             for i in 0..cnt {    
                 if let Some(evt) = self.events.get(i) { //index based loop to appease borrow checker
-                    //todo handle a return value that says when to break
                     match self.handle_event(evt.token(), evt.readiness(), poll) {
-                        Ok(()) => {},
+                        Ok(true) => {},
+                        Ok(false) => {
+                            info!("exiting server loop");
+                            return Ok(());
+                        }
                         Err(e) => {
                             warn!("error processing event: {:?}", e);
                         }
                     }
                 }
             }
-
-            self.handle_writes();
         }
     }
 
     fn handle_writes(&mut self) {
-        let write_tx = self.write.clone();
-        
-        for msg in write_tx.try_iter() {
-            match self.lookup_conn(msg.conn_idx).send_message(msg.buf) {
-                Ok(_) => {},
-                Err(e) => {
-                    error!("failed to send message to connection {:?}", e);
+        let mut new_writes = Vec::new();
+
+        for msg in self.write.try_iter() {
+            new_writes.push(msg);
+        }
+
+        for msg in new_writes {
+            if let Some(conn) = self.lookup_conn(msg.conn_idx) {
+                match conn.send_message(msg.buf) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        error!("failed to send message to connection {:?}", e);
+                    }
                 }
             }
         }
     }
 
-    fn handle_event(&mut self, token: Token, event: Ready, poll: &mut Poll) -> Result<()> {
+    fn handle_event(&mut self, token: Token, event: Ready, poll: &mut Poll) -> Result<(bool)> {
         debug!("{:?} event = {:?}", token, event);
         let conn_idx = usize::from(token);
 
         if self.token != token && !self.conns.contains(conn_idx) {
             warn!("unable to find connection for token {:?}", token);
-            return Ok(());
+            return Ok(true);
         }
 
         let uevent = UnixReady::from(event);
         if uevent.is_error()|| uevent.is_hup() {
             warn!("error signaled for connection {:?}", token);
             self.remove_conn(conn_idx);
-            return Ok(());
+            return Ok(true);
         }
 
         if event.is_writable() {
             assert!(self.token != token, "received writable event for server");
-            match self.lookup_conn(conn_idx).handle_write() {
-                Ok(()) => {},
-                Err(e) => {
-                    warn!("write event failed for connection {:?} due to error {:?}", token, e);
-                    self.conns.remove(conn_idx);
-                    return Ok(());
-                }
-            }     
+            let mut write_fail = false;
+
+            if let Some(conn) = self.lookup_conn(conn_idx) {
+                match conn.handle_write() {
+                    Ok(()) => {},
+                    Err(e) => {
+                        warn!("write event failed for connection {:?} due to error {:?}", token, e);
+                        write_fail = true;
+                    }
+                }  
+            } 
+
+            if write_fail {
+                self.conns.remove(conn_idx);
+                return Ok(true);
+            } 
         } 
         
         if event.is_readable() {
@@ -100,7 +120,8 @@ impl Server {
                 self.accept(poll);
             } else {
                 match self.dispatch_messages(conn_idx) {
-                    Ok(()) => {},
+                    Ok(true) => {},
+                    Ok(false) => return Ok(false),
                     Err(e) => {
                         warn!("failed to dispatch messages for connection {:?} due to error {:?}", token, e);
                     }
@@ -109,16 +130,23 @@ impl Server {
         }
 
         if self.token != token {
-            match self.lookup_conn(conn_idx).register(poll, false) {
-                Ok(()) => {},
-                Err(e) => {
-                    warn!("unable to reregister connection {:?} due to error {:?}", token, e);
-                    self.remove_conn(conn_idx);
+            let mut remove = false;
+            if let Some(conn) = self.lookup_conn(conn_idx) {
+                match conn.register(poll, false) {
+                    Ok(()) => {},
+                    Err(e) => {
+                        warn!("unable to reregister connection {:?} due to error {:?}", token, e);
+                        remove = true;
+                    }
                 }
+            }
+
+            if remove {
+                self.remove_conn(conn_idx);
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn accept(&mut self, poll: &mut Poll) {
@@ -137,30 +165,47 @@ impl Server {
             let token = Token::from(conn_idx);
 
             debug!("registering {:?} with poller", token);
-            match self.lookup_conn(conn_idx).register(poll, true) {
-                Ok(_) => {},
-                Err(e) => {
-                    error!("failed to register {:?} connection with poller, {:?}", token, e);
-                    self.remove_conn(conn_idx);
+            let mut remove = false;
+
+            if let Some(conn) = self.lookup_conn(conn_idx) {
+                match conn.register(poll, true) {
+                    Ok(_) => {},
+                    Err(e) => {
+                        error!("failed to register {:?} connection with poller, {:?}", token, e);
+                        remove = true;
+                    }
                 }
+            }
+
+            if remove {
+                self.remove_conn(conn_idx);
             }
         }
     }
 
-    fn dispatch_messages(&mut self, conn_idx: usize) -> Result<()> {
-        let read_sender = self.read.clone();
-        let conn = self.lookup_conn(conn_idx);
-        
-        while let Some(message) = conn.handle_read()? {
-            match read_sender.send(MsgBuf::new(conn_idx, message)) {
+    fn dispatch_messages(&mut self, conn_idx: usize) -> Result<(bool)> {
+        let read_idx = self.read_idx;
+        self.read_idx+=1 % self.read.len();
+
+        let mut new_msgs = Vec::new();
+
+        if let Some(conn) = self.lookup_conn(conn_idx) {
+            while let Some(message) = conn.handle_read()? {
+                new_msgs.push(message);   
+            }
+        }
+
+        for message in new_msgs {
+            match self.read[read_idx].send(MsgBuf::new(conn_idx, message)) {
                 Ok(()) => {},
                 Err(e) => {
-                    warn!("unable to dispatch message for connection {} due to {:?}", conn_idx, e);
+                    info!("unable to dispatch message for connection {} due to {:?}. presuming shutdown", conn_idx, e);
+                    return Ok(false);
                 }
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     fn add_conn(&mut self, sock: TcpStream) -> usize {
@@ -174,7 +219,13 @@ impl Server {
        self.conns.remove(conn_idx);
     }
 
-    fn lookup_conn(&mut self, conn_idx: usize) -> &mut Connection {
-        return self.conns.get_mut(conn_idx).expect("nonexistent connection");
+    fn lookup_conn(&mut self, conn_idx: usize) -> Option<&mut Connection> {
+        match self.conns.get_mut(conn_idx) {
+            Some(conn) => Some(conn),
+            None => {
+                info!("unable to look up connection {}", conn_idx);
+                None
+            }
+        }
     }
 }
