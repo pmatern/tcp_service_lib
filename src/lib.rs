@@ -12,7 +12,7 @@ mod worker;
 mod connection;
 mod server;
 
-mod errors {
+pub mod errors {
     use worker::MsgBuf;
 
     // Create the Error, ErrorKind, ResultExt, and Result types
@@ -30,11 +30,10 @@ mod errors {
     }
 }
 
-pub use errors::*;
-
 use std::net::SocketAddr;
 use mio::Poll;
 use mio::net::TcpListener;
+use errors::*;
 use worker::{Worker,MsgBuf};
 use server::Server;
 use std::sync::mpsc;
