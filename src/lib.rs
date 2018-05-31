@@ -12,7 +12,7 @@ mod worker;
 mod connection;
 mod server;
 
-mod errors {
+pub mod errors {
     use worker::MsgBuf;
 
     // Create the Error, ErrorKind, ResultExt, and Result types
@@ -208,14 +208,12 @@ mod tests {
         let addr: SocketAddr = "127.0.0.1:7866".parse().expect("couldn't parse address string");
         let num_workers = 4;
         if let Ok(sd) = ::bootstrap(addr, num_workers, &HANDLER) {
-            println!("got here");
-
-              match sd.shutdown() {
-                  Ok(()) => {},
-                  Err(_e) => {
-                      panic!("had trouble shutting down.");
-                  }
-              }
+            match sd.shutdown() {
+                Ok(()) => {},
+                Err(_e) => {
+                    panic!("had trouble shutting down.");
+                }
+            }
         }
     }
 }
