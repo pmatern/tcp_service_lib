@@ -185,12 +185,7 @@ impl Server {
 
     fn dispatch_messages(&mut self, conn_idx: usize) -> Result<(bool)> {
         let read_idx = self.read_idx;
-        let mut new_idx = self.read_idx+1;
-        if new_idx >= self.read.len() {
-            new_idx = 0;
-        }
-        
-        self.read_idx = new_idx;
+        self.read_idx = (read_idx+1) % self.read.len();
         
         let mut new_msgs = Vec::new();
 
