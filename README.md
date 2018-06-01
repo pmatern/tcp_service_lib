@@ -39,7 +39,7 @@ impl MessageHandler for Reverser {
 static HANDLER: Reverser = Reverser{};
 
 fn main() {
-    let addr: SocketAddr = "127.0.0.1:777".parse().expect("couldn't parse listen address");
+    let addr: SocketAddr = "127.0.0.1:7777".parse().expect("couldn't parse listen address");
     let num_workers = 4;
 
     if let Ok(_sd) = tcp_service_lib::bootstrap(addr, num_workers, &HANDLER) {    
