@@ -1,10 +1,10 @@
 use mio::{Poll, Events, Token, PollOpt, Ready};
 use mio::net::{TcpListener, TcpStream};
 use mio::unix::UnixReady;
-use std::sync::mpsc::{Sender, Receiver}; 
+use std::sync::mpsc::Sender; 
 use slab::Slab;
 use connection::Connection;
-use worker::MsgBuf;
+use worker::{MsgBuf, MessageSource};
 use errors::*;
 
 use std::io::ErrorKind;
@@ -13,18 +13,20 @@ pub struct Server {
     conns: Slab<Connection>,
     sock: TcpListener,
     token: Token,
+    write_token: Token,
     events: Events,
     read: Vec<Sender<MsgBuf>>,
-    write: Receiver<MsgBuf>,
+    write: MessageSource,
     read_idx: usize,
 }
 
 impl Server {
-    pub fn new(sock: TcpListener, read: Vec<Sender<MsgBuf>>, write: Receiver<MsgBuf>) -> Server {
+    pub fn new(sock: TcpListener, read: Vec<Sender<MsgBuf>>, write: MessageSource) -> Server {
         Server {
             conns: Slab::with_capacity(128),
             sock: sock,
             token: Token(10_000_000),
+            write_token: Token(10_000_001),
             events: Events::with_capacity(1024),
             read: read,
             write: write,
@@ -34,11 +36,9 @@ impl Server {
 
     pub fn run(&mut self, poll: &mut Poll) -> Result<()> {
         poll.register(&self.sock, self.token, Ready::readable(), PollOpt::edge())?;
+        poll.register(&self.write, self.write_token, Ready::writable(), PollOpt::edge())?;
         
         loop {
-            self.handle_writes();
-            
-            //write events coming in need to wake up this poller. may need to implement Evented for the write receiver after all
             let cnt = poll.poll(&mut self.events, None)?;
             debug!("processing {} events", cnt);
 
@@ -81,6 +81,11 @@ impl Server {
 
     fn handle_event(&mut self, token: Token, event: Ready, poll: &mut Poll) -> Result<(bool)> {
         debug!("{:?} event = {:?}", token, event);
+        if token == self.write_token {
+            self.handle_writes();
+            return Ok(true);
+        }
+
         let conn_idx = usize::from(token);
 
         if self.token != token && !self.conns.contains(conn_idx) {

@@ -1,6 +1,13 @@
 use ::MessageHandler;
-use std::sync::mpsc::{Sender, Receiver};
+use std::sync::mpsc::{Sender, Receiver,TryIter};
 use errors::*;
+use mio::{Evented, Poll, Token, Ready, PollOpt, Registration,SetReadiness};
+use std::io::Result as IOResult;
+
+pub fn write_pipeline(sender: Sender<MsgBuf>, receiver: Receiver<MsgBuf>) -> (MessageSource, MessageSink) {
+    let (registration, set_readiness) = Registration::new2();
+    (MessageSource{registration: registration, receiver: receiver}, MessageSink{sender: sender, set_readiness: set_readiness})
+}
 
 #[derive(Debug, Clone)]
 pub struct MsgBuf {
@@ -25,19 +32,60 @@ impl MsgBuf {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MessageSink {
+    sender: Sender<MsgBuf>,
+    set_readiness: SetReadiness,
+}
+
+impl MessageSink {
+    pub fn send_message(&self, msg: MsgBuf) -> Result<()> {
+        self.sender.send(msg)?;
+        self.set_readiness.set_readiness(Ready::writable())?;
+        Ok(())
+    }
+}
+
+
+pub struct MessageSource {
+    receiver: Receiver<MsgBuf>,
+    registration: Registration,
+}
+
+impl MessageSource {
+    pub fn try_iter(&self) -> TryIter<MsgBuf> {
+        self.receiver.try_iter()
+    }
+}
+
+impl Evented for MessageSource {
+    fn register(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> IOResult<()> {
+        self.registration.register(poll, token, interest, opts)
+    }
+
+    fn reregister(&self, poll: &Poll, token: Token, interest: Ready, opts: PollOpt) -> IOResult<()> {
+        self.registration.reregister(poll, token, interest, opts)
+    }
+
+    fn deregister(&self, poll: &Poll) -> IOResult<()> {
+        #[allow(deprecated)]
+        self.registration.deregister(poll)
+    }
+}
+
 pub struct Worker<'a, I: 'a, O: 'a> {
     handler: &'a MessageHandler<Req=I, Resp=O>,
     read_rx: Receiver<MsgBuf>,
-    write_tx: Sender<MsgBuf>,
+    sink: MessageSink,
 }
 
 impl<'a, I, O> Worker<'a, I, O> {
     pub fn new(handler: &'a MessageHandler<Req=I, Resp=O>, read_rx: Receiver<MsgBuf>, 
-            write_tx: Sender<MsgBuf>) -> Worker<'a, I, O> {
+            sink: MessageSink) -> Worker<'a, I, O> {
         Worker {
             handler: handler,
             read_rx: read_rx,
-            write_tx: write_tx
+            sink: sink,
         }
     }
 
@@ -100,7 +148,7 @@ impl<'a, I, O> Worker<'a, I, O> {
     }
 
     fn write_response(&self, buf: MsgBuf) -> bool {
-        match self.write_tx.send(buf) {
+        match self.sink.send_message(buf) {
             Ok(()) => true,
             Err(e) => {
                 info!("error sending output in worker: {:?}. presuming shutdown", e);
