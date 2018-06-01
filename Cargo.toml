@@ -1,5 +1,5 @@
 [package]
-name = "tcp-service-lib"
+name = "tcp_service_lib"
 version = "0.1.0"
 authors = ["Pete <pete.matern@nike.com>"]
 
@@ -9,5 +9,3 @@ log = "0.4.1"
 slab = "0.4.0"
 byteorder = "1.2.3"
 error-chain = "0.11.0"
-#crossbeam = "0.3.2"
-#crossbeam-channel = "0.1.2"
